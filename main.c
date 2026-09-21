@@ -8,18 +8,20 @@
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
-#include <sys/stat.h>
 
 enum { M_NONE, M_FILE, M_BUILD, M_SET };
-enum { F_EDIT, F_OUT, F_PICK };
+enum { F_EDIT, F_OUT, F_PICK, F_FIND };
+
+#define SIDE 56
+#define VISMAX 240
 
 static int menu, msel, focus = F_EDIT, font = 1, tabw = 4, ask;
-static int toprow, outtop, pick_n, pick_sel, pinning, want_quit;
-static char pin[400], prompt[80];
+static int outtop, pick_n, pick_sel, pinning, want_quit;
+static char pin[400], prompt[80], findq[80];
 static char picks[64][80];
 static char work[400] = "/home/working";
 
-static uint16_t Cbg, Cfg, Cbar, Cbarfg, Cacc, Cdim, Csel, Ckw, Cstr, Ccom, Ccur;
+static uint16_t Cbg, Cfg, Cbar, Cbarfg, Cacc, Cdim, Csel, Ckw, Cstr, Ccom, Ccur, Chit;
 
 static struct termios oldt;
 static int rawon;
@@ -37,6 +39,7 @@ static void colors(void)
     Cstr = rgb565(200, 170, 90);
     Ccom = rgb565(80, 160, 100);
     Ccur = rgb565(240, 220, 90);
+    Chit = rgb565(80, 60, 20);
 }
 
 static void io_open(void)
@@ -80,6 +83,7 @@ static void draw_code(int x, int y, const char *s, int sc)
     while (i < n) {
         uint16_t col = Cfg;
         int j = i, w;
+        char tmp[VISMAX];
         if (s[i] == '/' && s[i + 1] == '/') {
             text_s(x, y, s + i, Ccom, sc);
             return;
@@ -95,7 +99,8 @@ static void draw_code(int x, int y, const char *s, int sc)
             if (s[j])
                 j++;
             col = Cstr;
-        } else if (s[i] == '#' || (s[i] >= 'A' && s[i] <= 'z' && (s[i] == '_' || ((s[i] | 32) >= 'a')))) {
+        } else if (s[i] == '#' || s[i] == '_' ||
+                   (s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z')) {
             j = i + 1;
             while ((s[j] >= '0' && s[j] <= '9') || s[j] == '_' ||
                    (s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= 'a' && s[j] <= 'z'))
@@ -103,19 +108,15 @@ static void draw_code(int x, int y, const char *s, int sc)
             if (s[i] == '#' || is_kw(s + (s[i] == '#' ? i + 1 : i),
                                      s[i] == '#' ? j - i - 1 : j - i))
                 col = Ckw;
-        } else {
+        } else
             j = i + 1;
-        }
-        {
-            char tmp[ECMAX];
-            w = j - i;
-            if (w >= ECMAX)
-                w = ECMAX - 1;
-            memcpy(tmp, s + i, (size_t)w);
-            tmp[w] = 0;
-            text_s(x, y, tmp, col, sc);
-            x += w * font_w(sc);
-        }
+        w = j - i;
+        if (w >= VISMAX)
+            w = VISMAX - 1;
+        memcpy(tmp, s + i, (size_t)w);
+        tmp[w] = 0;
+        text_s(x, y, tmp, col, sc);
+        x += w * font_w(sc);
         i = j;
     }
 }
@@ -130,10 +131,18 @@ static int ed_rows(void)
 
 static int ed_cols(void)
 {
-    int w = (int)FB_W - 28;
+    int w = (int)FB_W - SIDE - 26;
     int cw = font_w(font);
     int c = cw ? w / cw : 40;
-    return c < 10 ? 10 : c;
+    return c < 8 ? 8 : c;
+}
+
+static void short8(char *out, const char *name, int dirty)
+{
+    char tmp[16];
+    snprintf(tmp, sizeof tmp, "%s", name);
+    tmp[8] = 0;
+    snprintf(out, 12, "%s%s", dirty ? "*" : "", tmp);
 }
 
 static void scan_dir(void)
@@ -147,19 +156,16 @@ static void scan_dir(void)
         size_t n = strlen(e->d_name);
         if (e->d_name[0] == '.')
             continue;
-        if (n > 2 && (!strcmp(e->d_name + n - 2, ".c") || !strcmp(e->d_name + n - 2, ".h")))
-            snprintf(picks[pick_n++], 80, "%s", e->d_name);
-        else if (!strcmp(e->d_name, "Makefile"))
+        if ((n > 2 && (!strcmp(e->d_name + n - 2, ".c") || !strcmp(e->d_name + n - 2, ".h")))
+            || !strcmp(e->d_name, "Makefile"))
             snprintf(picks[pick_n++], 80, "%s", e->d_name);
     }
     closedir(d);
-    if (pick_sel >= pick_n)
-        pick_sel = pick_n ? pick_n - 1 : 0;
 }
 
 static void draw_pick(void)
 {
-    int i, x = 40, y = 30, w = 200, h = 16 + pick_n * 12;
+    int i, x = SIDE + 20, y = 30, w = 200, h = 16 + pick_n * 12;
     if (h > (int)FB_H - 50)
         h = (int)FB_H - 50;
     fill(x, y, w, h, Csel);
@@ -172,19 +178,34 @@ static void draw_pick(void)
     }
 }
 
+static void highlight_find(int x, int y, const char *vis, int sc)
+{
+    const char *p;
+    int cw = font_w(sc), qn;
+    if (!findq[0])
+        return;
+    qn = (int)strlen(findq);
+    p = vis;
+    while ((p = strstr(p, findq)) != NULL) {
+        int col = (int)(p - vis);
+        fill(x + col * cw, y, qn * cw, font_h(sc), Chit);
+        p += qn;
+    }
+}
+
 static void draw(void)
 {
     int sc = font, ch = font_h(sc), cw = font_w(sc);
     int er = ed_rows(), ec = ed_cols();
-    int i, y0 = 18, split, outh;
-    char st[96], ln[8], vis[ECMAX];
+    int i, y0 = 18, split, outh, gx = SIDE;
+    char st[120], ln[8], vis[VISMAX], lab[12];
 
-    if (ecy < toprow)
-        toprow = ecy;
-    if (ecy >= toprow + er)
-        toprow = ecy - er + 1;
-    if (toprow < 0)
-        toprow = 0;
+    if (D->cy < D->top)
+        D->top = D->cy;
+    if (D->cy >= D->top + er)
+        D->top = D->cy - er + 1;
+    if (D->top < 0)
+        D->top = 0;
     if (bsel < outtop)
         outtop = bsel;
     if (bsel >= outtop + 4)
@@ -203,80 +224,93 @@ static void draw(void)
             text(x, 4, t[k], menu == ids[k] ? Cbg : Cbarfg);
             x += w + 8;
         }
-        text((int)FB_W - 50, 4, "ccde", Cacc);
+        text((int)FB_W - 40, 4, "ccde", Cacc);
     }
 
-    /* gutter + editor */
-    fill(0, 16, 26, er * ch + 4, Cbar);
+    /* project / tab strip */
+    fill(0, 16, SIDE, (int)FB_H - 16 - 14, Cbar);
+    text(4, 20, "tabs", Cdim);
+    for (i = 0; i < NTAB; i++) {
+        int y = 34 + i * 22;
+        short8(lab, e_name_i(i), tabs[i].dirty);
+        if (i == curtab)
+            fill(1, y - 2, SIDE - 2, 18, Cacc);
+        text(4, y + 2, lab, i == curtab ? Cbg : Cbarfg);
+    }
+
+    fill(SIDE, 16, 24, er * ch + 4, rgb565(16, 20, 28));
     for (i = 0; i < er; i++) {
-        int li = toprow + i;
+        int li = D->top + i;
         int y = y0 + i * ch;
-        if (li >= elines)
+        const char *src;
+        int n, off = 0;
+        if (li >= e_n())
             break;
         snprintf(ln, sizeof ln, "%3d", li + 1);
-        text_s(2, y, ln, li == ecy ? Cacc : Cdim, sc);
-        {
-            int n = (int)strlen(eline[li]);
-            int off = 0;
-            if (li == ecy && ecx >= ec)
-                off = ecx - ec + 1;
-            if (n - off > ec)
-                n = off + ec;
-            if (n < off)
-                n = off;
-            memcpy(vis, eline[li] + off, (size_t)(n - off));
-            vis[n - off] = 0;
-            draw_code(28, y, vis, sc);
-            if (li == ecy && focus == F_EDIT && !menu && !ask && !pinning && focus != F_PICK) {
-                int col = ecx - off;
-                fill(28 + col * cw, y, cw, ch, Ccur);
-            }
+        text_s(SIDE + 1, y, ln, li == D->cy ? Cacc : Cdim, sc);
+        src = e_line(li);
+        n = (int)strlen(src);
+        if (li == D->cy && D->cx >= ec)
+            off = D->cx - ec + 1;
+        if (n - off > ec)
+            n = off + ec;
+        if (n < off)
+            n = off;
+        if (n - off >= VISMAX)
+            n = off + VISMAX - 1;
+        memcpy(vis, src + off, (size_t)(n - off));
+        vis[n - off] = 0;
+        highlight_find(gx + 26, y, vis, sc);
+        draw_code(gx + 26, y, vis, sc);
+        if (li == D->cy && focus == F_EDIT && !menu && !ask && !pinning) {
+            int col = D->cx - off;
+            fill(gx + 26 + col * cw, y, cw, ch, Ccur);
         }
     }
 
     split = 16 + er * ch + 4;
-    fill(0, split, (int)FB_W, 12, Cbar);
-    text(4, split + 2, blast_ok == 1 ? "build ok" : blast_ok == 0 ? "build fail" : "output",
+    fill(SIDE, split, (int)FB_W - SIDE, 12, Cbar);
+    text(SIDE + 4, split + 2,
+         blast_ok == 1 ? "build ok" : blast_ok == 0 ? "build fail" : "output",
          blast_ok == 1 ? Ccom : blast_ok == 0 ? rgb565(220, 80, 70) : Cbarfg);
 
     outh = (int)FB_H - split - 12 - 14;
-    fill(0, split + 12, (int)FB_W, outh, rgb565(8, 10, 16));
+    fill(SIDE, split + 12, (int)FB_W - SIDE, outh, rgb565(8, 10, 16));
     for (i = 0; i < 5 && i * 10 < outh; i++) {
         int li = outtop + i;
         int y = split + 14 + i * 10;
         if (li >= blogn)
             break;
         if (li == bsel)
-            fill(0, y - 1, (int)FB_W, 10, Csel);
-        text(4, y, blog[li], li == bsel ? Cfg : Cdim);
+            fill(SIDE, y - 1, (int)FB_W - SIDE, 10, Csel);
+        text(SIDE + 4, y, blog[li], li == bsel ? Cfg : Cdim);
     }
 
     fill(0, (int)FB_H - 14, (int)FB_W, 14, Cbar);
-    if (pinning)
+    if (pinning || focus == F_FIND)
         snprintf(st, sizeof st, "%s%s", prompt, pin);
     else
-        snprintf(st, sizeof st, "%s%s  L%d  F5 build  F6 run  Esc menu  ^X quit",
-                 edirty ? "*" : "", e_name(), ecy + 1);
+        snprintf(st, sizeof st, "%s%s L%d  ^B build ^R run ^F find ^P/^I tabs ^X",
+                 e_dirty() ? "*" : "", e_name(), D->cy + 1);
     text(4, (int)FB_H - 11, st, Cbarfg);
 
     if (menu) {
         const char *it[8];
-        int n = 0, x = 4, y = 16, w = 150, k;
+        int n = 0, x = SIDE + 4, y = 16, w = 150, k;
         if (menu == M_FILE) {
             it[n++] = "Open…";
             it[n++] = "Save   ^S";
-            it[n++] = "New";
+            it[n++] = "New tab";
             it[n++] = "Quit   ^X";
-            x = 4;
         } else if (menu == M_BUILD) {
-            it[n++] = "Build  F5";
-            it[n++] = "Run    F6";
+            it[n++] = "Build  ^B";
+            it[n++] = "Run    ^R";
             it[n++] = "Goto error";
-            x = 44;
+            x = SIDE + 44;
         } else {
             it[n++] = font == 1 ? "Font small" : "Font large";
             it[n++] = tabw == 2 ? "Tab 2" : tabw == 8 ? "Tab 8" : "Tab 4";
-            x = 96;
+            x = SIDE + 96;
         }
         fill(x, y, w, 6 + n * 14, Csel);
         rect(x, y, w, 6 + n * 14, Cacc);
@@ -292,7 +326,7 @@ static void draw(void)
         int w = 260, h = 60, x = ((int)FB_W - 260) / 2, y = 80;
         fill(x, y, w, h, Csel);
         rect(x, y, w, h, Cacc);
-        text(x + 10, y + 12, "Save changes?", Cfg);
+        text(x + 10, y + 12, "Save this tab?", Cfg);
         text(x + 10, y + 32, "Y save   N discard   Esc", Cdim);
     }
     fb_flip();
@@ -319,24 +353,29 @@ static void open_sel(void)
 static void jump_err(void)
 {
     char file[120], full[512];
-    int line = 0;
+    int line = 0, t;
     if (!b_parse_jump(&line, file, sizeof file))
         return;
     if (strchr(file, '/'))
         snprintf(full, sizeof full, "%s", file);
     else
         snprintf(full, sizeof full, "%s/%s", work, file);
-    if (e_load(full) || !strcmp(e_name(), file) || strstr(epath, file)) {
-        if (strcmp(epath, full))
-            e_load(full);
-        e_goto(line);
-        focus = F_EDIT;
+    for (t = 0; t < NTAB; t++) {
+        if (tabs[t].path[0] && strstr(tabs[t].path, file)) {
+            e_select(t);
+            e_goto(line);
+            focus = F_EDIT;
+            return;
+        }
     }
+    e_load(full);
+    e_goto(line);
+    focus = F_EDIT;
 }
 
 static void do_quit_request(void)
 {
-    if (edirty)
+    if (e_dirty())
         ask = 1;
     else
         want_quit = 1;
@@ -345,7 +384,7 @@ static void do_quit_request(void)
 static void handle_ask(unsigned char c)
 {
     if (c == 'y' || c == 'Y') {
-        if (epath[0])
+        if (D->path[0])
             e_save();
         ask = 0;
         want_quit = 1;
@@ -356,6 +395,20 @@ static void handle_ask(unsigned char c)
         ask = 0;
 }
 
+static void start_find(void)
+{
+    focus = F_FIND;
+    snprintf(prompt, sizeof prompt, "find: ");
+    snprintf(pin, sizeof pin, "%s", findq);
+}
+
+static void find_go(int dir)
+{
+    snprintf(findq, sizeof findq, "%s", pin);
+    if (!e_find(findq, dir))
+        snprintf(prompt, sizeof prompt, "find (no): ");
+}
+
 static void menu_enter(void)
 {
     if (menu == M_FILE) {
@@ -363,9 +416,11 @@ static void menu_enter(void)
             open_pick();
         else if (msel == 1)
             e_save();
-        else if (msel == 2)
-            e_clear();
-        else if (msel == 3)
+        else if (msel == 2) {
+            e_next(1);
+            if (!tabs[curtab].path[0] && !tabs[curtab].dirty)
+                e_clear();
+        } else if (msel == 3)
             do_quit_request();
         menu = M_NONE;
     } else if (menu == M_BUILD) {
@@ -376,7 +431,8 @@ static void menu_enter(void)
         else if (msel == 2)
             jump_err();
         menu = M_NONE;
-        focus = F_OUT;
+        if (msel < 2)
+            focus = F_OUT;
     } else if (menu == M_SET) {
         if (msel == 0)
             font = font == 1 ? 2 : 1;
@@ -391,12 +447,20 @@ static void handle(unsigned char c, unsigned char *seq, int n)
         handle_ask(c);
         return;
     }
-    if (pinning) {
+    if (focus == F_FIND) {
         size_t L = strlen(pin);
-        if (c == 13 || c == 10)
-            pinning = 0;
-        else if (c == 27)
-            pinning = 0;
+        if (c == 13 || c == 10) {
+            find_go(1);
+            return;
+        }
+        if (c == 27) {
+            focus = F_EDIT;
+            return;
+        }
+        if (c == 14)
+            find_go(1);
+        else if (c == 16)
+            find_go(-1);
         else if ((c == 8 || c == 127) && L)
             pin[L - 1] = 0;
         else if (c >= 32 && c < 127 && L + 1 < sizeof pin) {
@@ -413,11 +477,42 @@ static void handle(unsigned char c, unsigned char *seq, int n)
         e_save();
         return;
     }
+    if (c == 2) { /* Ctrl+B */
+        b_make();
+        focus = F_OUT;
+        return;
+    }
+    if (c == 18) { /* Ctrl+R */
+        b_run();
+        focus = F_OUT;
+        return;
+    }
+    if (c == 6 || (c == '/' && focus == F_EDIT && D->cx == 0 && !e_line(D->cy)[0])) {
+        start_find();
+        return;
+    }
+    if (c == 6) {
+        start_find();
+        return;
+    }
+    if (c == 16) { /* Ctrl+P prev tab */
+        e_next(-1);
+        return;
+    }
+    if (c == 20) { /* Ctrl+T insert indent spaces */
+        e_tab(tabw);
+        return;
+    }
+    if (c == 9) { /* Tab / Ctrl+I → next editor tab */
+        e_next(1);
+        return;
+    }
+    if (c >= '1' && c <= '3' && menu == M_NONE && focus == F_EDIT && 0)
+        e_select(c - '1');
     if (c == 15) {
         open_pick();
         return;
     }
-    /* F5 = ESC [ 1 5 ~    F6 = ESC [ 1 7 ~ */
     if (c == 27 && n >= 4 && seq[1] == '[' && seq[2] == '1') {
         if (seq[3] == '5') {
             b_make();
@@ -431,7 +526,7 @@ static void handle(unsigned char c, unsigned char *seq, int n)
         }
     }
     if (focus == F_PICK) {
-        if (c == 27) {
+        if (c == 27 && n == 1) {
             focus = F_EDIT;
             return;
         }
@@ -448,11 +543,6 @@ static void handle(unsigned char c, unsigned char *seq, int n)
     if (menu) {
         if (c == 27 && n == 1) {
             menu = M_NONE;
-            return;
-        }
-        if (c == 9) {
-            menu = menu == M_FILE ? M_BUILD : menu == M_BUILD ? M_SET : M_FILE;
-            msel = 0;
             return;
         }
         if (c == 13 || c == 10) {
@@ -486,14 +576,6 @@ static void handle(unsigned char c, unsigned char *seq, int n)
         msel = 0;
         return;
     }
-    if (c == 9 && focus == F_EDIT) {
-        e_tab(tabw);
-        return;
-    }
-    if (c == 9) {
-        focus = focus == F_EDIT ? F_OUT : F_EDIT;
-        return;
-    }
     if (focus == F_OUT) {
         if (c == 27 && n >= 3 && seq[2] == 'A' && bsel > 0)
             bsel--;
@@ -501,6 +583,8 @@ static void handle(unsigned char c, unsigned char *seq, int n)
             bsel++;
         if (c == 13 || c == 10)
             jump_err();
+        if (c == 11)
+            focus = F_EDIT;
         return;
     }
     if (c == 27 && n >= 3 && seq[1] == '[') {
@@ -536,6 +620,7 @@ static void handle(unsigned char c, unsigned char *seq, int n)
 
 int main(int argc, char **argv)
 {
+    e_init();
     if (argc > 1) {
         char *slash;
         e_load(argv[1]);
@@ -554,7 +639,7 @@ int main(int argc, char **argv)
         return 1;
     }
     io_open();
-    b_add("ccde — Esc menu, F5 build, F6 run");
+    b_add("ccde  ^B build  ^R run  ^F find  ^P/^I tabs");
     while (!want_quit) {
         unsigned char b[24];
         int n = (int)read(0, b, sizeof b), i;
